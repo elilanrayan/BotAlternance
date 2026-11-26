@@ -228,7 +228,7 @@ def fetch_lba() -> list[dict]:
     except Exception as e:
         print(f"[LBA] Erreur : {e}")
 
-    return offers
+    return []
 
 
 # --- SOURCE 3 : FRANCE TRAVAIL API (Optionnel, si clés fournies) ---
