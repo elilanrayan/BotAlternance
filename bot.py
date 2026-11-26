@@ -295,6 +295,135 @@ def fetch_france_travail() -> list[dict]:
 
     return offers
 
+# --- SOURCE 4 : LINKEDIN (Endpoint public sans connexion) ---
+def fetch_linkedin() -> list[dict]:
+    offers = []
+    search_url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    queries = [
+        "alternance game programmer",
+        "alternance unity c#",
+        "alternance unreal c++",
+    ]
+    seen_urls = set()
+
+    for q in queries:
+        try:
+            params = {
+                "keywords": q,
+                "location": "Paris, Île-de-France, France",
+                "f_TPR": "r604800",  # 7 derniers jours
+                "start": 0,
+            }
+            resp = requests.get(search_url, params=params, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                print(f"[LinkedIn] Statut {resp.status_code} pour '{q}'")
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            cards = soup.select("li > div.base-card")
+
+            for card in cards:
+                link_el = card.find("a", class_="base-card__full-link")
+                title_el = card.find("h3", class_="base-search-card__title")
+                company_el = card.find("h4", class_="base-search-card__subtitle")
+                loc_el = card.find("span", class_="job-search-card__location")
+
+                url = (link_el["href"].split("?")[0] if link_el and link_el.has_attr("href") else "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                title = title_el.get_text(" ", strip=True) if title_el else ""
+                company = company_el.get_text(" ", strip=True) if company_el else "Entreprise LinkedIn"
+                location = loc_el.get_text(" ", strip=True) if loc_el else "Île-de-France"
+
+                full_text = f"{title} {company} {location}"
+                if not is_alternance(full_text):
+                    continue
+
+                ok_loc, loc_label = is_idf_or_remote(location)
+                if not ok_loc:
+                    continue
+
+                tags = is_relevant_game_prog(full_text, strict_game=True)
+                if not tags:
+                    continue
+
+                offers.append({
+                    "id": make_id(url, f"{title}_{company}"),
+                    "title": title[:200],
+                    "company": company[:100],
+                    "location": loc_label,
+                    "url": url,
+                    "source": "LinkedIn",
+                    "tags": tags[:6],
+                })
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"[LinkedIn] Erreur sur '{q}' : {e}")
+
+    return offers
+
+
+# --- SOURCE 5 : INDEED (Flux RSS / recherche France) ---
+def fetch_indeed() -> list[dict]:
+    offers = []
+    feed_urls = [
+        "https://fr.indeed.com/rss?q=alternance+unity+OR+unreal+OR+game+programmer&l=%C3%8Ele-de-France",
+        "https://fr.indeed.com/rss?q=alternance+c%2B%2B+OR+c%23+jeu+video&l=Paris+%2875%29",
+    ]
+    seen_links = set()
+
+    for feed_url in feed_urls:
+        try:
+            resp = requests.get(feed_url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                print(f"[Indeed] Statut {resp.status_code} sur le flux RSS")
+                continue
+
+            # Parse le XML du flux RSS sans dépendance externe
+            soup = BeautifulSoup(resp.text, "xml")
+            items = soup.find_all("item")
+
+            for item in items:
+                title = (item.find("title").get_text(" ", strip=True) if item.find("title") else "")
+                link = (item.find("link").get_text(" ", strip=True) if item.find("link") else "")
+                desc = (item.find("description").get_text(" ", strip=True) if item.find("description") else "")
+
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+
+                # Nettoie le HTML éventuel dans la description RSS
+                desc_text = BeautifulSoup(desc, "html.parser").get_text(" ", strip=True)
+                full_text = f"{title} {desc_text}"
+
+                if not is_alternance(full_text):
+                    continue
+
+                ok_loc, loc_label = is_idf_or_remote(full_text)
+                if not ok_loc:
+                    continue
+
+                tags = is_relevant_game_prog(full_text, strict_game=True)
+                if not tags:
+                    continue
+
+                offers.append({
+                    "id": make_id(link, title),
+                    "title": title[:200],
+                    "company": "Voir l'annonce Indeed",
+                    "location": loc_label,
+                    "url": link,
+                    "source": "Indeed",
+                    "tags": tags[:6],
+                })
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"[Indeed] Erreur : {e}")
+
+    return offers
+
 
 # --- ENVOI DISCORD ---
 def send_to_discord(offers: list[dict]) -> None:
@@ -336,6 +465,8 @@ def main() -> None:
     all_offers.extend(fetch_afjv())
     all_offers.extend(fetch_lba())
     all_offers.extend(fetch_france_travail())
+    all_offers.extend(fetch_linkedin())
+    all_offers.extend(fetch_indeed())
 
     # Déduplication entre sources et par rapport à l'historique
     new_offers = []
