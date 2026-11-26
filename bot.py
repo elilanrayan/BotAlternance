@@ -4,6 +4,7 @@ import os
 import re
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
 
 import requests
@@ -39,6 +40,7 @@ LANG_KEYWORDS = ["c++", "c#", "csharp", "cpp"]
 ALTERNANCE_KEYWORDS = [
     "alternance", "apprentissage", "apprenti", "alternant",
     "contrat pro", "contrat de professionnalisation",
+    "stage", "stagiaire", "internship",
 ]
 
 IDF_LOCATIONS = [
@@ -80,7 +82,6 @@ def is_alternance(text: str) -> bool:
 
 def is_idf_or_remote(text: str) -> tuple[bool, str]:
     norm = normalize(text)
-    # Codes postaux IDF (75xxx, 77xxx, 78xxx, 91xxx-95xxx) ou départements entre parenthèses
     if re.search(r"\b(?:75|77|78|91|92|93|94|95)\d{3}\b", norm) or re.search(
         r"\((?:75|77|78|91|92|93|94|95)\)", norm
     ):
@@ -96,9 +97,7 @@ def is_relevant_game_prog(text: str, strict_game: bool = False) -> list[str]:
     game_hits = find_keywords(text, GAME_TECH_KEYWORDS)
     lang_hits = find_keywords(text, LANG_KEYWORDS)
     if strict_game:
-        # Pour les plateformes généralistes : exige un marqueur Game Dev / Moteur 3D
         return game_hits + lang_hits if game_hits else []
-    # Pour les sites déjà spécialisés jeu vidéo (AFJV) : C++/C# seul suffit
     return game_hits + lang_hits if (game_hits or lang_hits) else []
 
 
@@ -147,7 +146,6 @@ def fetch_afjv() -> list[dict]:
                     continue
                 seen_links.add(full_url)
 
-                # Récupère le texte du bloc parent pour avoir titre + entreprise + contrat + ville
                 container = a.find_parent(["li", "article", "tr", "div"])
                 block_text = container.get_text(" ", strip=True) if container else a.get_text(" ", strip=True)
                 title = a.get_text(" ", strip=True)
@@ -180,54 +178,8 @@ def fetch_afjv() -> list[dict]:
     return offers
 
 
-# --- SOURCE 2 : API LA BONNE ALTERNANCE (Gouvernement - IDF) ---
+# --- SOURCE 2 : API LA BONNE ALTERNANCE (Désactivée : ancienne route v1 obsolète) ---
 def fetch_lba() -> list[dict]:
-    offers = []
-    api_url = "https://labonnealternance.apprentissage.beta.gouv.fr/api/v1/jobs"
-    params = {
-        "romes": "M1805,E1104",  # Dev informatique & Multimédia/Jeux
-        "latitude": 48.8566,
-        "longitude": 2.3522,
-        "radius": 60,
-        "insee": "75056",
-        "caller": "bot_alternance_gameprog",
-    }
-
-    try:
-        resp = requests.get(api_url, params=params, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-
-        buckets = []
-        for key in ("peJobs", "matchas"):
-            results = data.get(key, {}).get("results", [])
-            if isinstance(results, list):
-                buckets.extend(results)
-
-        for job in buckets:
-            title = job.get("title") or ""
-            desc = (job.get("job", {}) or {}).get("description", "") or ""
-            company = (job.get("company", {}) or {}).get("name", "Entreprise non précisée")
-            city = (job.get("place", {}) or {}).get("city") or "Île-de-France"
-            url = job.get("url") or ""
-
-            full_text = f"{title} {desc} {company}"
-            tags = is_relevant_game_prog(full_text, strict_game=True)
-            if not tags:
-                continue
-
-            offers.append({
-                "id": make_id(url, f"{title}_{company}"),
-                "title": title[:200],
-                "company": company[:100],
-                "location": city[:100],
-                "url": url or "https://labonnealternance.apprentissage.beta.gouv.fr/",
-                "source": "La Bonne Alternance",
-                "tags": tags[:6],
-            })
-    except Exception as e:
-        print(f"[LBA] Erreur : {e}")
-
     return []
 
 
@@ -259,8 +211,8 @@ def fetch_france_travail() -> list[dict]:
                 headers=auth_headers,
                 params={
                     "motsCles": q,
-                    "region": "11",       # Île-de-France
-                    "natureContrat": "E2", # Contrat d'apprentissage
+                    "region": "11",        # Île-de-France
+                    "natureContrat": "E2",  # Contrat d'apprentissage
                     "range": "0-24",
                 },
                 timeout=15,
@@ -295,14 +247,15 @@ def fetch_france_travail() -> list[dict]:
 
     return offers
 
+
 # --- SOURCE 4 : LINKEDIN (Endpoint public sans connexion) ---
 def fetch_linkedin() -> list[dict]:
     offers = []
     search_url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
     queries = [
-        "alternance game programmer",
-        "alternance unity c#",
-        "alternance unreal c++",
+        "alternance OR stage game programmer",
+        "alternance OR stage unity c#",
+        "alternance OR stage unreal c++",
     ]
     seen_urls = set()
 
@@ -369,8 +322,8 @@ def fetch_linkedin() -> list[dict]:
 def fetch_indeed() -> list[dict]:
     offers = []
     feed_urls = [
-        "https://fr.indeed.com/rss?q=alternance+unity+OR+unreal+OR+game+programmer&l=%C3%8Ele-de-France",
-        "https://fr.indeed.com/rss?q=alternance+c%2B%2B+OR+c%23+jeu+video&l=Paris+%2875%29",
+        "https://fr.indeed.com/rss?q=%28alternance+OR+stage%29+%28unity+OR+unreal+OR+game+programmer%29&l=%C3%8Ele-de-France",
+        "https://fr.indeed.com/rss?q=%28alternance+OR+stage%29+%28c%2B%2B+OR+c%23%29+jeu+video&l=Paris+%2875%29",
     ]
     seen_links = set()
 
@@ -381,20 +334,16 @@ def fetch_indeed() -> list[dict]:
                 print(f"[Indeed] Statut {resp.status_code} sur le flux RSS")
                 continue
 
-            # Parse le XML du flux RSS sans dépendance externe
-            soup = BeautifulSoup(resp.text, "xml")
-            items = soup.find_all("item")
-
-            for item in items:
-                title = (item.find("title").get_text(" ", strip=True) if item.find("title") else "")
-                link = (item.find("link").get_text(" ", strip=True) if item.find("link") else "")
-                desc = (item.find("description").get_text(" ", strip=True) if item.find("description") else "")
+            root = ET.fromstring(resp.text)
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                desc = (item.findtext("description") or "").strip()
 
                 if not link or link in seen_links:
                     continue
                 seen_links.add(link)
 
-                # Nettoie le HTML éventuel dans la description RSS
                 desc_text = BeautifulSoup(desc, "html.parser").get_text(" ", strip=True)
                 full_text = f"{title} {desc_text}"
 
@@ -425,12 +374,124 @@ def fetch_indeed() -> list[dict]:
     return offers
 
 
+# --- SOURCE 6 : WELCOME TO THE JUNGLE (Index Algolia public) ---
+def fetch_wttj() -> list[dict]:
+    offers = []
+    queries = [
+        "alternance stage game programmer",
+        "alternance stage unity c#",
+        "alternance stage unreal c++",
+    ]
+    seen_ids = set()
+
+    try:
+        page_resp = requests.get(
+            "https://www.welcometothejungle.com/fr/jobs",
+            headers=HEADERS,
+            timeout=15,
+        )
+        page_resp.raise_for_status()
+        html = page_resp.text
+
+        app_id_match = re.search(r'"algoliaApplicationId"\s*:\s*"([^"]+)"', html) or re.search(
+            r"algoliaApplicationId[\"']?\s*[:=]\s*[\"']([A-Z0-9]+)[\"']", html
+        )
+        api_key_match = re.search(r'"algoliaApiKey"\s*:\s*"([^"]+)"', html) or re.search(
+            r"algoliaApiKey[\"']?\s*[:=]\s*[\"']([a-zA-Z0-9]+)[\"']", html
+        )
+        index_match = re.search(r'"algoliaJobIndex"\s*:\s*"([^"]+)"', html) or re.search(
+            r"(wttj_[a-zA-Z0-9_-]*jobs[a-zA-Z0-9_-]*)", html
+        )
+
+        if not (app_id_match and api_key_match and index_match):
+            print("[WTTJ] Identifiants Algolia non trouvés sur la page (structure modifiée).")
+            return []
+
+        app_id = app_id_match.group(1)
+        api_key = api_key_match.group(1)
+        index_name = index_match.group(1)
+
+        algolia_url = f"https://{app_id}-dsn.algolia.net/1/indexes/{index_name}/query"
+        algolia_headers = {
+            "X-Algolia-Application-Id": app_id,
+            "X-Algolia-API-Key": api_key,
+            "Content-Type": "application/json",
+        }
+
+        for q in queries:
+            payload = {
+                "query": q,
+                "hitsPerPage": 30,
+                "aroundLatLng": "48.8566,2.3522",
+                "aroundRadius": 60000,  # ~60 km autour de Paris (Île-de-France)
+            }
+            resp = requests.post(algolia_url, json=payload, headers=algolia_headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"[WTTJ] Statut Algolia {resp.status_code} pour '{q}'")
+                continue
+
+            for hit in resp.json().get("hits", []):
+                ref = str(hit.get("reference") or hit.get("objectID") or "")
+                if not ref or ref in seen_ids:
+                    continue
+                seen_ids.add(ref)
+
+                title = hit.get("name") or hit.get("title") or ""
+                company_obj = hit.get("organization") or hit.get("company") or {}
+                company = company_obj.get("name") if isinstance(company_obj, dict) else str(company_obj or "Welcome to the Jungle")
+                slug_org = company_obj.get("slug") if isinstance(company_obj, dict) else ""
+
+                offices = hit.get("offices") or []
+                cities = []
+                if isinstance(offices, list):
+                    for off in offices:
+                        if isinstance(off, dict):
+                            c = off.get("city") or off.get("district") or ""
+                            if c:
+                                cities.append(c)
+                location_str = ", ".join(cities) or hit.get("city") or "Île-de-France"
+
+                contract = hit.get("contract_type") or ""
+                desc = hit.get("summary") or hit.get("description") or ""
+                full_text = f"{title} {contract} {company} {location_str} {desc}"
+
+                if not is_alternance(full_text):
+                    continue
+
+                ok_loc, loc_label = is_idf_or_remote(f"{location_str} {full_text}")
+                if not ok_loc:
+                    continue
+
+                tags = is_relevant_game_prog(full_text, strict_game=True)
+                if not tags:
+                    continue
+
+                if slug_org and hit.get("slug"):
+                    url = f"https://www.welcometothejungle.com/fr/companies/{slug_org}/jobs/{hit.get('slug')}"
+                else:
+                    url = "https://www.welcometothejungle.com/fr/jobs"
+
+                offers.append({
+                    "id": make_id(url, f"{title}_{company}_{ref}"),
+                    "title": title[:200],
+                    "company": company[:100],
+                    "location": loc_label,
+                    "url": url,
+                    "source": "Welcome to the Jungle",
+                    "tags": tags[:6],
+                })
+            time.sleep(1)
+    except Exception as e:
+        print(f"[WTTJ] Erreur : {e}")
+
+    return offers
+
+
 # --- ENVOI DISCORD ---
 def send_to_discord(offers: list[dict]) -> None:
     if not DISCORD_WEBHOOK_URL:
         raise ValueError("DISCORD_WEBHOOK_URL n'est pas défini dans les variables d'environnement.")
 
-    # Discord accepte jusqu'à 10 embeds par message ; on envoie par paquets de 5
     chunk_size = 5
     for i in range(0, len(offers), chunk_size):
         chunk = offers[i : i + chunk_size]
@@ -438,20 +499,20 @@ def send_to_discord(offers: list[dict]) -> None:
         for o in chunk:
             tags_str = " • ".join(f"`{t}`" for t in o["tags"])
             embeds.append({
-                "title": f"🎮 {o['title']}",
+                "title": f"🎮 {o['title'] or 'Offre Game Programming'}",
                 "url": o["url"],
                 "color": 0x5865F2,
                 "fields": [
-                    {"name": "Entreprise", "value": o["company"], "inline": True},
-                    {"name": "Lieu", "value": o["location"], "inline": True},
-                    {"name": "Source", "value": o["source"], "inline": True},
+                    {"name": "Entreprise", "value": o["company"] or "Non précisée", "inline": True},
+                    {"name": "Lieu", "value": o["location"] or "Île-de-France", "inline": True},
+                    {"name": "Source", "value": o["source"] or "Web", "inline": True},
                     {"name": "Mots-clés détectés", "value": tags_str or "Game Dev", "inline": False},
                 ],
             })
 
         payload = {
-            "username": "Bot Alternance Game Prog",
-            "content": f"🔥 **{len(offers)} nouvelle(s) offre(s) d'alternance trouvée(s) !**" if i == 0 else None,
+            "username": "Bot Alternance & Stage Game Prog",
+            "content": f"🔥 **{len(offers)} nouvelle(s) offre(s) d'alternance / stage trouvée(s) !**" if i == 0 else None,
             "embeds": embeds,
         }
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
@@ -467,8 +528,8 @@ def main() -> None:
     all_offers.extend(fetch_france_travail())
     all_offers.extend(fetch_linkedin())
     all_offers.extend(fetch_indeed())
+    all_offers.extend(fetch_wttj())
 
-    # Déduplication entre sources et par rapport à l'historique
     new_offers = []
     for offer in all_offers:
         if offer["id"] not in seen:
